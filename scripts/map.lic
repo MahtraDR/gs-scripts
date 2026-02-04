@@ -127,12 +127,253 @@ unless defined?(Gtk.queue)
   exit
 end
 
+# --- Dynamic Map: Zone Resolver ---
+# Determines which rooms to render together as a zone.
+# Four-layer fallback: genie_zone -> @image -> @location -> BFS connected component.
+# Game-agnostic: DR uses genie_zone (primary) + @image, GS uses @image + @location.
+module DynMap
+  module ZoneResolver
+    @cache = {}
+
+    def self.clear_cache
+      @cache = {}
+    end
+
+    def self.has_location?(room)
+      room.location.is_a?(String) && !room.location.empty?
+    end
+
+    def self.resolve(room)
+      return nil if room.nil?
+
+      zone_key = if room.respond_to?(:genie_zone) && room.genie_zone
+                   "gz:#{room.genie_zone}"
+                 elsif room.image
+                   "img:#{room.image}"
+                 elsif has_location?(room)
+                   "loc:#{room.location}"
+                 else
+                   "cc:#{room.id}"
+                 end
+
+      return @cache[zone_key] if @cache[zone_key]
+
+      rooms = if room.respond_to?(:genie_zone) && room.genie_zone
+                Map.list.select { |r| r && r.respond_to?(:genie_zone) && r.genie_zone == room.genie_zone }
+              elsif room.image
+                Map.list.select { |r| r && r.image == room.image }
+              elsif has_location?(room)
+                Map.list.select { |r| r && r.location == room.location }
+              else
+                bfs_zone(room)
+              end
+
+      @cache[zone_key] = { zone_id: zone_key, rooms: rooms }
+    end
+
+    def self.bfs_zone(start_room, max_depth: 40)
+      visited = { start_room.id => true }
+      queue = [[start_room, 0]]
+      result = [start_room]
+      while (entry = queue.shift)
+        current, depth = entry
+        next if depth >= max_depth
+        current.wayto.each_key do |target_id|
+          tid = target_id.to_i
+          next if visited[tid]
+          neighbor = Map[tid]
+          next if neighbor.nil?
+          # Stop at zone boundaries: rooms that have their own zone assignment
+          next if (neighbor.respond_to?(:genie_zone) && neighbor.genie_zone) || neighbor.image || has_location?(neighbor)
+          visited[tid] = true
+          result << neighbor
+          queue << [neighbor, depth + 1]
+        end
+      end
+      result
+    end
+  end
+
+  # --- Dynamic Map: Layout Engine ---
+  # Computes x/y positions for a set of rooms.
+  # Mode A: Use Genie positions directly when available.
+  # Mode B: Direction-based auto-layout (Genie4 algorithm) as fallback.
+  module LayoutEngine
+    DIRECTION_OFFSETS = {
+      'north' => [0, -1], 'south' => [0, 1],
+      'east' => [1, 0], 'west' => [-1, 0],
+      'northeast' => [1, -1], 'northwest' => [-1, -1],
+      'southeast' => [1, 1], 'southwest' => [-1, 1],
+      'n' => [0, -1], 's' => [0, 1], 'e' => [1, 0], 'w' => [-1, 0],
+      'ne' => [1, -1], 'nw' => [-1, -1], 'se' => [1, 1], 'sw' => [-1, 1],
+      'up' => [0, -1], 'down' => [0, 1], 'out' => [1, 0]
+    }.freeze
+
+    GRID_SPACING = 20
+
+    # Check if point (px, py) lies on the line segment between (ax, ay) and (bx, by).
+    # All coordinates are grid-aligned (multiples of GRID_SPACING), so integer math is exact.
+    def self.point_on_segment?(px, py, ax, ay, bx, by)
+      return false if ax == bx && ay == by # zero-length segment
+      cross = (bx - ax) * (py - ay) - (by - ay) * (px - ax)
+      return false unless cross == 0
+      px.between?([ax, bx].min, [ax, bx].max) && py.between?([ay, by].min, [ay, by].max)
+    end
+
+    # Check if a candidate position lies on any connection line between already-positioned rooms.
+    # When skip_neighbors_of is provided (a room_id), lines where either endpoint is
+    # a neighbor of that room are skipped — those are legitimate collinear placements
+    # (e.g., room B between A and C where A→B→C and A→C all exist).
+    def self.on_connection_line?(px, py, positions, room_index, skip_neighbors_of: nil)
+      skip_set = nil
+      if skip_neighbors_of
+        skip_room = room_index[skip_neighbors_of]
+        if skip_room
+          # All rooms connected to/from the room being checked
+          skip_set = {}
+          skip_room.wayto.each_key { |k| skip_set[k.to_i] = true }
+          room_index.each do |rid, r|
+            skip_set[rid] = true if r.wayto.key?(skip_neighbors_of.to_s)
+          end
+        end
+      end
+
+      positions.each do |room_id, pos|
+        room = room_index[room_id]
+        next unless room
+        room.wayto.each_key do |target_id|
+          tid = target_id.to_i
+          target_pos = positions[tid]
+          next unless target_pos
+          next if (px == pos[:x] && py == pos[:y]) || (px == target_pos[:x] && py == target_pos[:y])
+          # Skip lines to/from rooms that the checked room is connected to
+          next if skip_set && (skip_set[room_id] || skip_set[tid])
+          return true if point_on_segment?(px, py, pos[:x], pos[:y], target_pos[:x], target_pos[:y])
+        end
+      end
+      false
+    end
+
+    def self.layout(rooms, seed_room)
+      # Mode A: if rooms have Genie positions, use them directly
+      if rooms.all? { |r| r.respond_to?(:genie_pos) && r.genie_pos.is_a?(Array) && r.genie_pos.size == 3 }
+        positions = {}
+        rooms.each do |r|
+          positions[r.id] = { x: r.genie_pos[0], y: r.genie_pos[1], z: r.genie_pos[2] }
+        end
+        return positions
+      end
+
+      # Mode B: direction-based auto-layout
+      room_index = {}
+      rooms.each { |r| room_index[r.id] = r }
+
+      positions = {}
+      positions[seed_room.id] = { x: 0, y: 0, z: 0 }
+      occupied = { [0, 0] => true }
+
+      queue = [seed_room]
+      visited = { seed_room.id => true }
+
+      while (current = queue.shift)
+        cx = positions[current.id][:x]
+        cy = positions[current.id][:y]
+
+        current.wayto.each do |target_id, move_cmd|
+          tid = target_id.to_i
+          next if visited[tid]
+          next unless room_index[tid]
+
+          offset = direction_offset(move_cmd.to_s)
+
+          if offset
+            # Compass direction: place in that direction, push if occupied
+            new_x = cx + offset[0] * GRID_SPACING
+            new_y = cy + offset[1] * GRID_SPACING
+            attempts = 0
+            while occupied[[new_x, new_y]] && attempts < 15
+              new_x += offset[0] * GRID_SPACING
+              new_y += offset[1] * GRID_SPACING
+              attempts += 1
+            end
+          else
+            # Non-directional move (go X, climb X, StringProc):
+            # find nearest free adjacent cell instead of pushing along a default direction
+            new_x = cx + GRID_SPACING
+            new_y = cy
+          end
+
+          # Fallback: search all 8 adjacent cells for a free spot
+          if occupied[[new_x, new_y]]
+            [[1, 0], [0, 1], [-1, 0], [0, -1], [1, -1], [-1, -1], [1, 1], [-1, 1]].each do |dx, dy|
+              test_x = cx + dx * GRID_SPACING
+              test_y = cy + dy * GRID_SPACING
+              unless occupied[[test_x, test_y]]
+                new_x = test_x
+                new_y = test_y
+                break
+              end
+            end
+          end
+
+          positions[tid] = { x: new_x, y: new_y, z: 0 }
+          occupied[[new_x, new_y]] = true
+          visited[tid] = true
+          queue << room_index[tid]
+        end
+      end
+
+      # Post-processing: fix rooms placed on lines before those lines existed.
+      # The BFS check only catches lines already drawn at placement time.
+      # This pass handles the reverse case.
+      resolve_line_collisions(positions, occupied, room_index)
+
+      positions
+    end
+
+    # After all rooms are placed, find any room sitting on an UNRELATED connection
+    # line and nudge it off. "Unrelated" means neither endpoint is a neighbor of
+    # the room being checked — so legitimate collinear corridors are preserved.
+    def self.resolve_line_collisions(positions, occupied, room_index, max_passes: 3)
+      max_passes.times do
+        moved = false
+        positions.each do |room_id, pos|
+          next unless on_connection_line?(pos[:x], pos[:y], positions, room_index, skip_neighbors_of: room_id)
+
+          [[0, -1], [0, 1], [-1, 0], [1, 0], [1, -1], [-1, -1], [1, 1], [-1, 1]].each do |dx, dy|
+            nx = pos[:x] + dx * GRID_SPACING
+            ny = pos[:y] + dy * GRID_SPACING
+            unless occupied[[nx, ny]] || on_connection_line?(nx, ny, positions, room_index, skip_neighbors_of: room_id)
+              occupied.delete([pos[:x], pos[:y]])
+              pos[:x] = nx
+              pos[:y] = ny
+              occupied[[nx, ny]] = true
+              moved = true
+              break
+            end
+          end
+        end
+        break unless moved
+      end
+    end
+
+    def self.direction_offset(move_cmd)
+      return nil if move_cmd.start_with?(';e ') # StringProc -> non-directional
+      d = move_cmd.strip.downcase
+      return DIRECTION_OFFSETS[d] if DIRECTION_OFFSETS[d]
+      nil # go X, climb X, or anything else -> non-directional
+    end
+  end
+end
+
 if Script.current.vars[1] == 'help'
   echo "Version: #{(Script.list.find { |x| x.name == Script.current.name }.inspect)[/version: (\d+\.\d+\.\d+)/i, 1]}                                                                              "
   echo "   ;map help                   - this output                                                "
   echo "   ;map <number>               - shows LichID# in map window instead of current room        "
   echo "   ;map u<number>              - shows RealID# in map window instead of current room        "
   echo "   ;map <text to search>       - shows room# that first matches text instead of current room"
+  echo "   ;map genie                  - show Genie zone:node for current room                     "
+  echo "   ;map g<zone>:<node>         - show room by Genie reference (e.g. ;map g1:335)           "
   echo "   ;map reset                  - resets map settings to default values                      "
   echo "                                      keep_above = true                                     "
   echo "                                      global_scale = 1                                      "
@@ -294,6 +535,7 @@ if Script.current.vars[1] =~ /reset/i
   window_position[1] = [[monitor_y, window_position[1].to_i].max, monitor_y + monitor_height - 300].min
   CharSettings['window_position'] = window_position
   Settings['dark_mode'] = ((@theme_state || @theme_state == 'on') ? true : false)
+  Settings['dynamic_mode'] = false
   Settings.save
 end
 
@@ -356,6 +598,12 @@ current_room = nil
 current_map = nil
 short_current_map = nil
 start = nil
+
+# Dynamic map mode state
+dynamic_mode = Settings['dynamic_mode'] || false
+drawing_area = nil
+layout_cache = {} # zone_id => { positions: {}, rooms: [] }
+current_z_level = 0
 
 window = nil
 scroller = nil
@@ -641,6 +889,119 @@ find_clicked_room = proc { |click_x, click_y|
   }
 }
 
+# Find room by click position in dynamic rendering mode
+find_dynamic_room = proc { |click_x, click_y, zone_data, dyn_scale, offset_x, offset_y|
+  next nil unless zone_data
+  positions = zone_data[:positions]
+  rooms = zone_data[:rooms]
+  room_size = (8 * dyn_scale).to_i
+  half = room_size / 2
+  best_room = nil
+  best_dist = Float::INFINITY
+  rooms.each do |room|
+    pos = positions[room.id]
+    next unless pos
+    rx = (pos[:x] * dyn_scale + offset_x).to_i
+    ry = (pos[:y] * dyn_scale + offset_y).to_i
+    dist = Math.sqrt((click_x - rx)**2 + (click_y - ry)**2)
+    if dist < best_dist && dist < half + 5
+      best_dist = dist
+      best_room = room
+    end
+  end
+  best_room
+}
+
+# Render the dynamic map using Cairo
+render_dynamic_map = proc { |cr, widget_width, widget_height, room, zone_data, dyn_scale, z_level|
+  next unless room && zone_data
+  positions = zone_data[:positions]
+  rooms = zone_data[:rooms]
+
+  # Background
+  cr.set_source_rgb(0.12, 0.12, 0.18)
+  cr.paint
+
+  room_size = (8 * dyn_scale).to_i
+  half = room_size / 2
+
+  # Viewport offset: center on current room
+  current_pos = positions[room.id]
+  next unless current_pos
+  offset_x = (widget_width / 2) - (current_pos[:x] * dyn_scale).to_i
+  offset_y = (widget_height / 2) - (current_pos[:y] * dyn_scale).to_i
+
+  # Store offsets for click handling
+  zone_data[:offset_x] = offset_x
+  zone_data[:offset_y] = offset_y
+  zone_data[:scale] = dyn_scale
+
+  # Pass 1: Connection lines
+  cr.set_line_width(1)
+  rooms.each do |r|
+    pos = positions[r.id]
+    next unless pos
+    next unless pos[:z] == z_level
+    rx = (pos[:x] * dyn_scale + offset_x).to_i
+    ry = (pos[:y] * dyn_scale + offset_y).to_i
+    r.wayto.each_key do |target_id|
+      tid = target_id.to_i
+      tpos = positions[tid]
+      next unless tpos
+      tx = (tpos[:x] * dyn_scale + offset_x).to_i
+      ty = (tpos[:y] * dyn_scale + offset_y).to_i
+      if tpos[:z] == z_level
+        cr.set_source_rgb(0.45, 0.45, 0.50)
+      else
+        cr.set_source_rgba(0.45, 0.45, 0.50, 0.25) # dimmed cross-level
+      end
+      cr.move_to(rx, ry)
+      cr.line_to(tx, ty)
+      cr.stroke
+    end
+  end
+
+  # Pass 2: Off-level rooms (dimmed)
+  rooms.each do |r|
+    pos = positions[r.id]
+    next unless pos
+    next if pos[:z] == z_level
+    rx = (pos[:x] * dyn_scale + offset_x).to_i - half
+    ry = (pos[:y] * dyn_scale + offset_y).to_i - half
+    cr.set_source_rgba(0.35, 0.35, 0.40, 0.3)
+    cr.rectangle(rx, ry, room_size, room_size)
+    cr.fill
+  end
+
+  # Pass 3: Current-level rooms
+  rooms.each do |r|
+    pos = positions[r.id]
+    next unless pos
+    next unless pos[:z] == z_level
+    next if r.id == room.id # draw current room last
+    rx = (pos[:x] * dyn_scale + offset_x).to_i - half
+    ry = (pos[:y] * dyn_scale + offset_y).to_i - half
+    cr.set_source_rgb(0.22, 0.58, 0.88)
+    cr.rectangle(rx, ry, room_size, room_size)
+    cr.fill
+    cr.set_source_rgb(0.65, 0.65, 0.70)
+    cr.rectangle(rx, ry, room_size, room_size)
+    cr.stroke
+  end
+
+  # Pass 4: Current room (magenta)
+  if current_pos[:z] == z_level
+    rx = (current_pos[:x] * dyn_scale + offset_x).to_i - half
+    ry = (current_pos[:y] * dyn_scale + offset_y).to_i - half
+    cr.set_source_rgb(0.95, 0.15, 0.85)
+    cr.rectangle(rx, ry, room_size, room_size)
+    cr.fill
+    cr.set_source_rgb(1.0, 1.0, 1.0)
+    cr.rectangle(rx, ry, room_size, room_size)
+    cr.stroke
+  end
+}
+
 Gtk.queue {
   window = Gtk::Window.new
   window.title = "Map: #{Char.name}"
@@ -683,6 +1044,26 @@ Gtk.queue {
   circle_image.set_pixbuf(circle_pixbuf)
   layout.put(circle_image, -circle_width, -circle_height)
 
+  # Dynamic rendering surface (hidden by default, shown in dynamic mode)
+  drawing_area = Gtk::DrawingArea.new
+  drawing_area.set_size_request(800, 600)
+  drawing_area.signal_connect('draw') do |widget, cr|
+    next true if narost_exit
+    dyn_scale = scale || global_scale || 1.0
+    zone_key = if current_room.respond_to?(:genie_zone) && current_room.genie_zone
+                 "gz:#{current_room.genie_zone}"
+               elsif current_room&.image
+                 "img:#{current_room.image}"
+               elsif current_room
+                 "cc:#{current_room.id}"
+               end
+    zone_data = layout_cache[zone_key] if zone_key
+    render_dynamic_map.call(cr, widget.allocated_width, widget.allocated_height, current_room, zone_data, dyn_scale, current_z_level)
+    true
+  end
+  layout.put(drawing_area, 0, 0)
+  drawing_area.hide
+
   menu_follow = Gtk::CheckMenuItem.new(:label => 'follow current room')
   menu_follow.active = true
   setting_follow = true
@@ -694,7 +1075,10 @@ Gtk.queue {
 
   menu_borderless = Gtk::CheckMenuItem.new(:label => 'borderless')
   menu_borderless.active = setting_borderless
-  menu_borderless.signal_connect('toggled') { |owner| window.set_decorated(!setting_borderless = owner.active?) }
+  menu_borderless.signal_connect('toggled') { |owner|
+    setting_borderless = owner.active?
+    window.set_decorated(!setting_borderless)
+  }
 
   menu_hide_scrollbars = Gtk::CheckMenuItem.new(:label => 'hide scrollbars')
   menu_hide_scrollbars.active = setting_hide_scrollbars
@@ -896,6 +1280,41 @@ Gtk.queue {
   menu.append(menu_scale_map)
   menu.append(menu_tags)
   menu.append(menu_locations)
+  menu.append(Gtk::SeparatorMenuItem.new)
+
+  menu_dynamic = Gtk::CheckMenuItem.new(:label => 'dynamic map')
+  menu_dynamic.active = dynamic_mode
+  menu_dynamic.signal_connect('toggled') { |owner|
+    dynamic_mode = owner.active?
+    Gtk.queue {
+      if dynamic_mode
+        # Switch to dynamic rendering
+        image.hide
+        circle_image.hide
+        drawing_area.set_size_request(scroller.allocation.width, scroller.allocation.height)
+        drawing_area.show
+        # Compute layout for current zone
+        if current_room
+          zone = DynMap::ZoneResolver.resolve(current_room)
+          if zone
+            positions = DynMap::LayoutEngine.layout(zone[:rooms], current_room)
+            layout_cache[zone[:zone_id]] = { positions: positions, rooms: zone[:rooms] }
+          end
+        end
+        drawing_area.queue_draw
+      else
+        # Switch back to static rendering
+        drawing_area.hide
+        image.show
+        if current_room && current_room.map_name
+          file_name = File.join(map_dir, current_room.map_name)
+          change_map.call(file_name)
+          change_room.call
+        end
+      end
+    }
+  }
+  menu.append(menu_dynamic)
 
   menu.show_all
 
@@ -1024,58 +1443,90 @@ Gtk.queue {
       else
         dragging = false
         if (ev.event_type == Gdk::EventType::BUTTON_RELEASE) and (ev.button == 1)
-          pointer_x, pointer_y = get_pointer.call(layout.parent.parent)
-          click_x = ((scroller.hadjustment.value.to_i + pointer_x.to_i - map_offset_x.to_i) / scale.to_f) - window_offset_x
-          click_y = ((scroller.vadjustment.value.to_i + pointer_y.to_i - map_offset_y.to_i) / scale.to_f) - window_offset_y
-
-          # fixme: check state correctly
-          if (ev.state.inspect =~ /shift-mask.*control-mask|control-mask.*shift-mask/) and (script.vars[0] =~ /fix/)
-            map_name = current_map.slice(/([^\/\\]+)$/)
-            if fix_click.nil?
-              fix_click = [click_x, click_y]
-            else
-              x = ((click_x + fix_click[0]) / 2).round
-              y = ((click_y + fix_click[1]) / 2).round
-              size = ((([click_x, fix_click[0]].max - [click_x, fix_click[0]].min) + ([click_y, fix_click[1]].max - [click_y, fix_click[1]].min)) / 2).round
-              current_room = $narost_fake_room || Room.current
-              respond "#{current_room.id}; x: #{x}, y: #{y}, size: #{size}"
-              if defined?(current_room.image_coords)
-                current_room.image = map_name
-                current_room.image_coords = [[fix_click[0].round, click_x.round].min, [fix_click[1].round, click_y.round].min, [fix_click[0].round, click_x.round].max, [fix_click[1].round, click_y.round].max]
+          if dynamic_mode
+            # Dynamic mode click handling
+            pointer_x, pointer_y = get_pointer.call(layout.parent.parent)
+            zone_key = if current_room.respond_to?(:genie_zone) && current_room.genie_zone
+                         "gz:#{current_room.genie_zone}"
+                       elsif current_room&.image
+                         "img:#{current_room.image}"
+                       elsif current_room
+                         "cc:#{current_room.id}"
+                       end
+            zone_data = layout_cache[zone_key] if zone_key
+            if zone_data && zone_data[:offset_x]
+              dyn_scale = zone_data[:scale] || scale || 1.0
+              clicked_room = find_dynamic_room.call(
+                pointer_x, pointer_y, zone_data, dyn_scale,
+                zone_data[:offset_x], zone_data[:offset_y]
+              )
+              if clicked_room
+                if ev.state.inspect =~ /shift-mask/
+                  respond
+                  respond clicked_room
+                  respond
+                else
+                  start_script 'go2', [clicked_room.id.to_s, '_disable_confirm_']
+                end
               else
-                current_room.map_name = map_name
-                current_room.map_x = x
-                current_room.map_y = y
-                current_room.map_roomsize = size
+                respond '[map: no matching room found]'
               end
-              fix_click = nil
-            end
-          elsif ev.state.inspect =~ /control-mask/
-            respond "x: #{click_x}, y: #{click_y}"
-          elsif ev.state.inspect =~ /shift-mask/
-            if (clicked_room = find_clicked_room.call(click_x, click_y))
-              respond
-              respond clicked_room
-              respond
-            else
-              respond '[map: no matching room found]'
             end
           else
-            if (clicked_link = find_clicked_link(current_map, click_x, click_y))
-              change_map.call(clicked_link[0])
-              scroller.hadjustment.value = clicked_link[1].to_i * scale
-              scroller.vadjustment.value = clicked_link[2].to_i * scale
-            elsif (clicked_room = find_clicked_room.call(click_x, click_y))
-              start_script 'go2', [clicked_room.id.to_s, '_disable_confirm_']
+            pointer_x, pointer_y = get_pointer.call(layout.parent.parent)
+            click_x = ((scroller.hadjustment.value.to_i + pointer_x.to_i - map_offset_x.to_i) / scale.to_f) - window_offset_x
+            click_y = ((scroller.vadjustment.value.to_i + pointer_y.to_i - map_offset_y.to_i) / scale.to_f) - window_offset_y
+
+            # fixme: check state correctly
+            if (ev.state.inspect =~ /shift-mask.*control-mask|control-mask.*shift-mask/) and (script.vars[0] =~ /fix/)
+              map_name = current_map.slice(/([^\/\\]+)$/)
+              if fix_click.nil?
+                fix_click = [click_x, click_y]
+              else
+                x = ((click_x + fix_click[0]) / 2).round
+                y = ((click_y + fix_click[1]) / 2).round
+                size = ((([click_x, fix_click[0]].max - [click_x, fix_click[0]].min) + ([click_y, fix_click[1]].max - [click_y, fix_click[1]].min)) / 2).round
+                current_room = $narost_fake_room || Room.current
+                respond "#{current_room.id}; x: #{x}, y: #{y}, size: #{size}"
+                if defined?(current_room.image_coords)
+                  current_room.image = map_name
+                  current_room.image_coords = [[fix_click[0].round, click_x.round].min, [fix_click[1].round, click_y.round].min, [fix_click[0].round, click_x.round].max, [fix_click[1].round, click_y.round].max]
+                else
+                  current_room.map_name = map_name
+                  current_room.map_x = x
+                  current_room.map_y = y
+                  current_room.map_roomsize = size
+                end
+                fix_click = nil
+              end
+            elsif ev.state.inspect =~ /control-mask/
+              respond "x: #{click_x}, y: #{click_y}"
+            elsif ev.state.inspect =~ /shift-mask/
+              if (clicked_room = find_clicked_room.call(click_x, click_y))
+                respond
+                respond clicked_room
+                respond
+              else
+                respond '[map: no matching room found]'
+              end
             else
-              respond '[map: no matching room found]'
+              if (clicked_link = find_clicked_link(current_map, click_x, click_y))
+                change_map.call(clicked_link[0])
+                scroller.hadjustment.value = clicked_link[1].to_i * scale
+                scroller.vadjustment.value = clicked_link[2].to_i * scale
+              elsif (clicked_room = find_clicked_room.call(click_x, click_y))
+                start_script 'go2', [clicked_room.id.to_s, '_disable_confirm_']
+              else
+                respond '[map: no matching room found]'
+              end
             end
           end
-        end
+        end # dynamic_mode else
       end
     }
   }
   setting_borderless ? window.set_decorated(false) : window.set_decorated(true)
+  drawing_area.hide if drawing_area # ensure hidden on startup
   window.show_all
 
   # Get the default display and primary monitor
@@ -1124,6 +1575,10 @@ before_dying {
   }
   sleep 0.01 while window_height.nil?
   Gtk.queue {
+    # Detach the DrawingArea before destroying the window to prevent
+    # a GTK3/macOS Quartz segfault in _gdk_quartz_unref_cairo_surface
+    drawing_area.hide if drawing_area
+    drawing_area.destroy if drawing_area
     menu.destroy
     window.destroy
   }
@@ -1134,6 +1589,7 @@ before_dying {
   Settings['global_scale'] = global_scale
   Settings['map_scale'] = map_scale
   Settings['dark_mode'] = dark_mode
+  Settings['dynamic_mode'] = dynamic_mode
   Settings['opacity'] = opacity
   Settings['borderless'] = setting_borderless
   Settings['hide_scrollbars'] = setting_hide_scrollbars
@@ -1143,7 +1599,39 @@ before_dying {
 
 wait_until { start }
 
-if script.vars[1] and (script.vars[1] !~ /^fix|trouble$/) and (current_room = Room[script.vars[1..-1].join(' ')]) and (map_name = current_room.map_name)
+# Genie cross-reference commands
+if script.vars[1] == 'genie'
+  room = Room.current
+  if room && room.respond_to?(:genie_id) && room.genie_id
+    respond "[map: Lich ##{room.id} = Genie #{room.genie_zone}:#{room.genie_id}]"
+  else
+    respond "[map: current room (##{room&.id}) has no Genie mapping]"
+  end
+  exit
+elsif script.vars[1] =~ /^g(\w+):(\w+)$/i
+  genie_zone = $1
+  genie_node = $2
+  if Room.respond_to?(:by_genie_ref) && (found = Room.by_genie_ref(genie_zone, genie_node))
+    respond "[map: Genie #{genie_zone}:#{genie_node} = Lich ##{found.id} (#{found.title&.first})]"
+    current_room = found
+    if found.map_name
+      menu_follow.active = false
+      setting_follow = false
+      file_name = File.join(map_dir, found.map_name)
+      Gtk.queue {
+        change_map.call(file_name) unless current_map == file_name
+        change_room.call
+      }
+      room_count = $room_count
+      sleep 0.2 while (room_count == $room_count) and not narost_exit
+      wait_until { setting_follow or narost_exit } unless setting_follow or narost_exit
+    end
+  else
+    respond "[map: no Lich room found for Genie #{genie_zone}:#{genie_node}]"
+  end
+end
+
+if script.vars[1] and (script.vars[1] !~ /^fix|trouble|genie$/) and (script.vars[1] !~ /^g\w+:\w+$/i) and (current_room = Room[script.vars[1..-1].join(' ')]) and (map_name = current_room.map_name)
   menu_follow.active = false
   setting_follow = false
   file_name = File.join(map_dir, map_name)
@@ -1157,12 +1645,33 @@ if script.vars[1] and (script.vars[1] !~ /^fix|trouble$/) and (current_room = Ro
 end
 
 until narost_exit
-  if (current_room = Room.current) and (map_name = current_room.map_name)
-    file_name = File.join(map_dir, map_name)
-    Gtk.queue {
-      change_map.call(file_name) unless current_map == file_name
-      change_room.call
-    }
+  if (current_room = Room.current)
+    if dynamic_mode
+      # Dynamic mode: resolve zone, compute layout, redraw
+      zone = DynMap::ZoneResolver.resolve(current_room)
+      if zone && !layout_cache[zone[:zone_id]]
+        positions = DynMap::LayoutEngine.layout(zone[:rooms], current_room)
+        layout_cache[zone[:zone_id]] = { positions: positions, rooms: zone[:rooms] }
+      end
+      # Update z-level from current room's position
+      if zone && layout_cache[zone[:zone_id]]
+        pos = layout_cache[zone[:zone_id]][:positions][current_room.id]
+        current_z_level = pos[:z] if pos
+      end
+      Gtk.queue {
+        drawing_area.set_size_request(scroller.allocation.width, scroller.allocation.height)
+        drawing_area.queue_draw
+        window.title = "Map: #{Char.name} (##{current_room.id})"
+      }
+    elsif (map_name = current_room.map_name)
+      file_name = File.join(map_dir, map_name)
+      Gtk.queue {
+        change_map.call(file_name) unless current_map == file_name
+        change_room.call
+      }
+    else
+      no_room.call
+    end
   else
     no_room.call
   end
