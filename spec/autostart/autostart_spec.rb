@@ -1,10 +1,11 @@
-# Spec for the generic autostart loop in scripts/autostart.lic (lines 197-227).
+# Spec for autostart.lic startup logic:
+# 1. Game-agnostic YAML autostart loop (lines 137-150)
+# 2. Generic Settings/CharSettings autostart loop (lines 201-233)
 #
 # We do NOT load the .lic file because it depends on heavy Lich infrastructure
 # (Settings, CharSettings, Script, XMLData, Gem::Version, LICH_VERSION, etc.).
-# Instead we extract and exercise the relevant code path through a helper method
-# that mirrors the production logic, including the Script.running? guard added
-# to prevent double-starts.
+# Instead we extract and exercise the relevant code paths through helper methods
+# that mirror the production logic.
 
 # -- Mocks ----------------------------------------------------------------
 
@@ -82,10 +83,96 @@ module MockXMLData
   end
 end
 
-# -- Helper that mirrors the generic autostart loop -----------------------
+module MockMap
+  @applied = false
 
-# This replicates lines 197-227 of autostart.lic (after the fix).
-# It uses the Mock* modules so we can assert behavior without Lich runtime.
+  class << self
+    attr_reader :applied
+
+    def apply_wayto_overrides
+      @applied = true
+    end
+
+    def respond_to?(method, include_private = false)
+      method == :apply_wayto_overrides || super
+    end
+
+    def reset!
+      @applied = false
+    end
+  end
+end
+
+module MockUserVars
+  @store = {}
+
+  class << self
+    def autostart_scripts
+      @store[:autostart_scripts]
+    end
+
+    def autostart_scripts=(val)
+      @store[:autostart_scripts] = val
+    end
+
+    def reset!
+      @store = {}
+    end
+  end
+end
+
+# -- Helper that mirrors the game-agnostic YAML autostart loop ------------
+
+# Replicates lines 137-158 of autostart.lic.
+#
+# @param script_mod [Module] mock for Script (running?, exists?, start)
+# @param map_mod [Module] mock for Map (apply_wayto_overrides)
+# @param user_vars_mod [Module] mock for UserVars (autostart_scripts)
+# @param yaml_autostarts [Array<String>, nil] simulated get_settings.autostarts
+# @param has_get_settings [Boolean] whether get_settings is available
+# @param respond_output [Array<String>] collects warning messages
+# @return [Array<String>, nil] list of started script names, or nil if skipped
+def run_yaml_autostart_loop(script_mod: MockScript,
+                            map_mod: MockMap,
+                            user_vars_mod: MockUserVars,
+                            yaml_autostarts: [],
+                            has_get_settings: true,
+                            respond_output: [])
+  return unless has_get_settings
+
+  user_vars_mod.autostart_scripts ||= []
+  all_autostarts = (user_vars_mod.autostart_scripts.to_a +
+                    yaml_autostarts.to_a).uniq
+
+  map_mod.apply_wayto_overrides if map_mod.respond_to?(:apply_wayto_overrides)
+
+  started = []
+  all_autostarts.each do |script_name|
+    next if script_name == 'dependency'
+    next if defined?(DR_OBSOLETE_SCRIPTS) && DR_OBSOLETE_SCRIPTS.include?(script_name)
+    next if script_mod.running?(script_name)
+
+    unless script_mod.exists?(script_name)
+      respond_output << "\n--- autostart: '#{script_name}' not found, skipping\n\n"
+      next
+    end
+
+    started << script_name
+    script_mod.start(script_name)
+  end
+  started
+end
+
+# -- Helper that mirrors the generic Settings/CharSettings autostart loop --
+
+# Replicates lines 199-231 of autostart.lic.
+#
+# @param settings_mod [Module] mock for Settings
+# @param char_settings_mod [Module] mock for CharSettings
+# @param script_mod [Module] mock for Script
+# @param xml_data_mod [Module] mock for XMLData
+# @param lich_version [String] simulated LICH_VERSION
+# @param respond_output [Array<String>] collects warning messages
 def run_generic_autostart_loop(settings_mod: MockSettings,
                                char_settings_mod: MockCharSettings,
                                script_mod: MockScript,
@@ -292,6 +379,254 @@ RSpec.describe "Generic autostart loop" do
 
       run_generic_autostart_loop
       expect(MockScript.started).to eq([{ name: 'nilargs', args: nil }])
+    end
+  end
+end
+
+RSpec.describe "YAML autostart loop (game-agnostic)" do
+  before do
+    MockScript.reset!
+    MockMap.reset!
+    MockUserVars.reset!
+  end
+
+  describe "YAML autostarts" do
+    it "starts scripts from YAML autostarts list" do
+      started = run_yaml_autostart_loop(yaml_autostarts: ['esp', 'afk'])
+      expect(started).to eq(['esp', 'afk'])
+    end
+
+    it "does nothing when get_settings is not available" do
+      started = run_yaml_autostart_loop(yaml_autostarts: ['esp'], has_get_settings: false)
+      expect(started).to be_nil
+    end
+
+    it "handles empty YAML autostarts" do
+      started = run_yaml_autostart_loop(yaml_autostarts: [])
+      expect(started).to eq([])
+    end
+
+    it "handles nil YAML autostarts via .to_a" do
+      started = run_yaml_autostart_loop(yaml_autostarts: nil)
+      expect(started).to eq([])
+    end
+  end
+
+  describe "UserVars autostarts" do
+    it "starts scripts from UserVars.autostart_scripts" do
+      MockUserVars.autostart_scripts = ['my-script']
+      started = run_yaml_autostart_loop(yaml_autostarts: [])
+      expect(started).to eq(['my-script'])
+    end
+
+    it "initializes UserVars.autostart_scripts to empty array when nil" do
+      MockUserVars.autostart_scripts = nil
+      run_yaml_autostart_loop(yaml_autostarts: [])
+      expect(MockUserVars.autostart_scripts).to eq([])
+    end
+  end
+
+  describe "merging UserVars and YAML" do
+    it "combines and deduplicates UserVars and YAML autostarts" do
+      MockUserVars.autostart_scripts = ['shared', 'uvar-only']
+      started = run_yaml_autostart_loop(yaml_autostarts: ['shared', 'yaml-only'])
+      expect(started).to contain_exactly('shared', 'uvar-only', 'yaml-only')
+    end
+  end
+
+  describe "wayto overrides" do
+    it "applies Map.apply_wayto_overrides" do
+      run_yaml_autostart_loop(yaml_autostarts: [])
+      expect(MockMap.applied).to be true
+    end
+  end
+
+  describe "skip guards" do
+    it "skips dependency" do
+      started = run_yaml_autostart_loop(yaml_autostarts: ['dependency', 'esp'])
+      expect(started).to eq(['esp'])
+    end
+
+    it "skips scripts that are already running" do
+      MockScript.set_running('esp', true)
+      started = run_yaml_autostart_loop(yaml_autostarts: ['esp', 'afk'])
+      expect(started).to eq(['afk'])
+    end
+
+    it "skips scripts that do not exist" do
+      MockScript.reset!
+      # Override exists? to return false for a specific script
+      allow(MockScript).to receive(:exists?).and_call_original
+      allow(MockScript).to receive(:exists?).with('missing').and_return(false)
+      started = run_yaml_autostart_loop(yaml_autostarts: ['missing', 'afk'])
+      expect(started).to eq(['afk'])
+    end
+  end
+
+  describe "game-agnostic behavior" do
+    it "works for GSIV game type" do
+      MockXMLData.game = "GSIV"
+      started = run_yaml_autostart_loop(yaml_autostarts: ['esp', 'afk'])
+      expect(started).to eq(['esp', 'afk'])
+    end
+
+    it "works for DR game type" do
+      MockXMLData.game = "DRF"
+      started = run_yaml_autostart_loop(yaml_autostarts: ['moonwatch'])
+      expect(started).to eq(['moonwatch'])
+    end
+  end
+
+  describe "GS character with no YAML profiles" do
+    it "handles nil autostarts from missing base.yaml and no character profile" do
+      MockUserVars.autostart_scripts = nil
+      started = run_yaml_autostart_loop(yaml_autostarts: nil)
+      expect(started).to eq([])
+      expect(MockUserVars.autostart_scripts).to eq([])
+    end
+
+    it "still applies wayto overrides even with no autostarts" do
+      MockUserVars.autostart_scripts = nil
+      run_yaml_autostart_loop(yaml_autostarts: nil)
+      expect(MockMap.applied).to be true
+    end
+
+    it "handles empty autostarts from base.yaml without autostarts key" do
+      started = run_yaml_autostart_loop(yaml_autostarts: [])
+      expect(started).to eq([])
+    end
+  end
+
+  describe "adversarial inputs" do
+    it "handles nil entries in UserVars.autostart_scripts" do
+      MockUserVars.autostart_scripts = [nil, 'esp', nil]
+      allow(MockScript).to receive(:running?).and_call_original
+      allow(MockScript).to receive(:exists?).and_call_original
+      allow(MockScript).to receive(:running?).with(nil).and_return(false)
+      allow(MockScript).to receive(:exists?).with(nil).and_return(false)
+      started = run_yaml_autostart_loop(yaml_autostarts: [])
+      expect(started).to eq(['esp'])
+    end
+
+    it "handles nil entries in YAML autostarts" do
+      allow(MockScript).to receive(:running?).and_call_original
+      allow(MockScript).to receive(:exists?).and_call_original
+      allow(MockScript).to receive(:running?).with(nil).and_return(false)
+      allow(MockScript).to receive(:exists?).with(nil).and_return(false)
+      started = run_yaml_autostart_loop(yaml_autostarts: [nil, 'afk', nil])
+      expect(started).to eq(['afk'])
+    end
+
+    it "handles empty string script names" do
+      allow(MockScript).to receive(:exists?).and_call_original
+      allow(MockScript).to receive(:exists?).with('').and_return(false)
+      started = run_yaml_autostart_loop(yaml_autostarts: ['', 'esp'])
+      expect(started).to eq(['esp'])
+    end
+
+    it "deduplicates across UserVars and YAML when both contain the same script" do
+      MockUserVars.autostart_scripts = ['esp', 'afk']
+      started = run_yaml_autostart_loop(yaml_autostarts: ['afk', 'esp'])
+      expect(started).to eq(['esp', 'afk'])
+    end
+
+    it "deduplicates within UserVars itself" do
+      MockUserVars.autostart_scripts = ['esp', 'esp', 'esp']
+      started = run_yaml_autostart_loop(yaml_autostarts: [])
+      expect(started).to eq(['esp'])
+    end
+
+    it "deduplicates within YAML autostarts itself" do
+      started = run_yaml_autostart_loop(yaml_autostarts: ['afk', 'afk', 'afk'])
+      expect(started).to eq(['afk'])
+    end
+
+    it "handles both UserVars and YAML being nil simultaneously" do
+      MockUserVars.autostart_scripts = nil
+      started = run_yaml_autostart_loop(yaml_autostarts: nil)
+      expect(started).to eq([])
+    end
+
+    it "starts nothing when all scripts are already running" do
+      MockScript.set_running('esp', true)
+      MockScript.set_running('afk', true)
+      started = run_yaml_autostart_loop(yaml_autostarts: ['esp', 'afk'])
+      expect(started).to eq([])
+    end
+
+    it "starts nothing when no scripts exist on disk" do
+      allow(MockScript).to receive(:exists?).and_return(false)
+      output = []
+      started = run_yaml_autostart_loop(yaml_autostarts: ['fake1', 'fake2'], respond_output: output)
+      expect(started).to eq([])
+      expect(output.size).to eq(2)
+    end
+
+    it "skips dependency even when it appears in both UserVars and YAML" do
+      MockUserVars.autostart_scripts = ['dependency']
+      started = run_yaml_autostart_loop(yaml_autostarts: ['dependency', 'esp'])
+      expect(started).to eq(['esp'])
+    end
+  end
+
+  describe "missing script warnings" do
+    it "warns when a YAML autostart script does not exist" do
+      allow(MockScript).to receive(:exists?).and_call_original
+      allow(MockScript).to receive(:exists?).with('typo-script').and_return(false)
+      output = []
+      started = run_yaml_autostart_loop(yaml_autostarts: ['typo-script'], respond_output: output)
+      expect(started).to eq([])
+      expect(output).to include(a_string_matching(/typo-script.*not found/))
+    end
+
+    it "warns when a UserVars autostart script does not exist" do
+      MockUserVars.autostart_scripts = ['gone-script']
+      allow(MockScript).to receive(:exists?).and_call_original
+      allow(MockScript).to receive(:exists?).with('gone-script').and_return(false)
+      output = []
+      started = run_yaml_autostart_loop(yaml_autostarts: [], respond_output: output)
+      expect(started).to eq([])
+      expect(output).to include(a_string_matching(/gone-script.*not found/))
+    end
+
+    it "warns for each missing script individually" do
+      allow(MockScript).to receive(:exists?).and_return(false)
+      output = []
+      run_yaml_autostart_loop(yaml_autostarts: ['bad1', 'bad2', 'bad3'], respond_output: output)
+      expect(output.size).to eq(3)
+      expect(output[0]).to match(/bad1/)
+      expect(output[1]).to match(/bad2/)
+      expect(output[2]).to match(/bad3/)
+    end
+
+    it "does not warn for scripts that exist and are started" do
+      output = []
+      started = run_yaml_autostart_loop(yaml_autostarts: ['esp'], respond_output: output)
+      expect(started).to eq(['esp'])
+      expect(output).to be_empty
+    end
+
+    it "does not warn for scripts that are already running" do
+      MockScript.set_running('esp', true)
+      output = []
+      run_yaml_autostart_loop(yaml_autostarts: ['esp'], respond_output: output)
+      expect(output).to be_empty
+    end
+
+    it "does not warn for dependency (skipped before exists? check)" do
+      output = []
+      run_yaml_autostart_loop(yaml_autostarts: ['dependency'], respond_output: output)
+      expect(output).to be_empty
+    end
+
+    it "warns for missing scripts alongside successful starts" do
+      allow(MockScript).to receive(:exists?).and_call_original
+      allow(MockScript).to receive(:exists?).with('missing').and_return(false)
+      output = []
+      started = run_yaml_autostart_loop(yaml_autostarts: ['esp', 'missing', 'afk'], respond_output: output)
+      expect(started).to eq(['esp', 'afk'])
+      expect(output.size).to eq(1)
+      expect(output.first).to match(/missing.*not found/)
     end
   end
 end
