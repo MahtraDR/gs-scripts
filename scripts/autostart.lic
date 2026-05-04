@@ -218,6 +218,8 @@ if script.vars.empty?
           end
           next
         else
+          next if Script.running?(script_info[:name])
+
           Script.start(script_info[:name], :args => script_info[:args])
         end
 
