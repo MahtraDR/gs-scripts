@@ -129,7 +129,7 @@ end
 # -- Specs ----------------------------------------------------------------
 
 RSpec.describe "Generic autostart loop" do
-  before(:each) do
+  before do
     MockScript.reset!
     MockSettings.reset!
     MockCharSettings.reset!
@@ -171,13 +171,8 @@ RSpec.describe "Generic autostart loop" do
       MockSettings['scripts'] = [{ name: 'shared', args: [] }]
       MockCharSettings['scripts'] = [{ name: 'shared', args: [] }]
 
-      # The first start will succeed; the second iteration should see it
-      # as "started" only if the mock tracks it.  Since our mock does not
-      # auto-set running? after start, we simulate the real behavior:
-      # the Script.running? guard will be false both times unless we
-      # manually flag it.  In production Lich, Script.start makes it
-      # running.  We test that the guard is present by marking it running
-      # after the first call.
+      # Simulate production behavior: Script.start makes the script running,
+      # so the second iteration's running? check should return true.
       allow(MockScript).to receive(:start).and_wrap_original do |meth, *args, **kwargs|
         meth.call(*args, **kwargs)
         MockScript.set_running(args.first, true)
