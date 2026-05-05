@@ -9,10 +9,12 @@
   contributors: Athias
           game: any
           tags: core
-       version: 0.67
+       version: 0.68
       required: Lich >= 4.6.58
 
   changelog:
+    0.68 (2026-05-05):
+      game-agnostic YAML autostarts, wayto overrides, and double-start guard
     0.67 (2026-04-03):
       DR: when core lich provides get_settings/start_scripts_if_available,
       own the autostart loop directly instead of delegating to dependency.lic
